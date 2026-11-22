@@ -57,7 +57,10 @@ static bool cdrom_init(char *playlist_path) {
 	FILE *fp = fopen(playlist_path, "r");
 	if (fp) {
 		// Skip the first line
-		fgets(buf, sizeof(buf), fp);
+		if (!fgets(buf, sizeof(buf), fp)) {
+			fclose(fp);
+			return false;
+		}
 	} else {
 		fp = fopen("_inmm.ini", "r");
 	}
