@@ -34,6 +34,7 @@
 #include "gfx.h"
 #include "scheduler.h"
 #include "ags.h"
+#include "font.h"
 #include "nact.h"
 #include "debugger.h"
 #include "selection.h"
@@ -42,6 +43,7 @@
 #include "input.h"
 #include "menu.h"
 #include "hankaku.h"
+#include "music.h"
 
 /*
 
@@ -57,6 +59,8 @@ MG コマンド: 表示時の ZH に依存
 
 /* 半角モード */
 static int msg_msgHankakuMode = 0; /* 0:全角 1:半角, 2: 無変換 */
+static CharacterEncoding default_encoding = SHIFT_JIS;
+static bool encoding_locked = false;
 
 /* ゲームシステム情報 */
 static NACTINFO nactprv;
@@ -68,13 +72,36 @@ void sys_setHankakuMode(int mode) {
 }
 
 void sys_setCharacterEncoding(CharacterEncoding encoding) {
+	font_set_encoding(encoding);
 	nact->encoding = encoding;
 	v_set_encoding(encoding);
 }
 
+void sys_setDefaultCharacterEncoding(CharacterEncoding encoding, bool locked) {
+	default_encoding = encoding;
+	if (locked)
+		encoding_locked = true;
+	sys_setCharacterEncoding(encoding);
+}
+
+bool sys_isCharacterEncodingLocked(void) {
+	return encoding_locked;
+}
+
+#if defined(ALICEHUB_IOS) || defined(XSYSTEM35_EMBEDDED)
+void sys_resetCharacterEncoding(void) {
+	encoding_locked = false;
+	sys_setDefaultCharacterEncoding(SHIFT_JIS, false);
+}
+#endif
+
 /* 選択肢・通常メッセージ振り分け */
 void sys_addMsg(const char *str) {
 	const char *msg = NULL;
+
+	if (!encoding_locked && nact->encoding == SHIFT_JIS && cjk_looks_like_gbk((const uint8_t *)str)) {
+		sys_setDefaultCharacterEncoding(GBK, false);
+	}
 
 	switch(msg_msgHankakuMode) {
 	case 0:
@@ -132,15 +159,18 @@ void nact_main() {
 }
 
 static void nact_callback() {
+	mus_update();
 	if (nact->is_va_animation) {
 		va_animation();
 	}
 	if (nact->is_cursor_animation) {
 		/* cursor animation */
 	}
+#if !defined(__ANDROID__) && !defined(ALICEHUB_IOS)
 	if (nact->is_quit && !nact->restart) {
 		sys_exit(0);
 	}
+#endif
 }
 
 void nact_init() {
@@ -149,11 +179,8 @@ void nact_init() {
 	nact->callback = nact_callback;
 	nact->is_va_animation = false;
 	nact->is_cursor_animation = false;
-	nact->encoding = SHIFT_JIS;
-#ifdef XSYSTEM35_EMBEDDED
-	if (xsystem35_host_gbk()) nact->encoding = GBK;
-#endif
-	v_set_encoding(nact->encoding);
+	nact->encoding = default_encoding;
+	v_set_encoding(default_encoding);
 
 	free(nact->game_title_utf8);
 	nact->game_title_utf8 = NULL;

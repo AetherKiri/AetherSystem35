@@ -81,6 +81,7 @@ void xsystem35_host_log(int level, const char *message) {
         host->log(host->user, level, message);
 }
 
+int xsystem35_host_fixed_encoding(void) { return host && host->fixed_encoding; }
 int xsystem35_host_gbk(void) { return host && host->gbk_text; }
 
 void xsystem35_host_clear_input(void) { event_reset_input_state(); }

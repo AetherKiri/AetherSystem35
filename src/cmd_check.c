@@ -166,6 +166,10 @@ static void message(int c0) {
 			*p++ = (char)c0; *p++ = (char)sl_getc();
 		} else if (c0 == 0x20) {
 			*p++ = (char)c0;
+		} else if (nact->encoding == GBK) {
+			*p++ = (char)c0;
+			if (CHECKGBK1BYTE(c0))
+				*p++ = (char)sl_getc();
 		} else if (c0 >= 0xe0) {
 			*p++ = (char)c0; *p++ = (char)sl_getc();
 		} else if (c0 >= 0xa0) {

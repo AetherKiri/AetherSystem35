@@ -26,6 +26,7 @@
 
 #include "sdl_compat.h"
 #include "cache.h"
+#include "utfsjis.h"
 #include "config.h"
 #include "portab.h"
 
@@ -48,6 +49,8 @@ typedef struct {
 
 extern void font_init(void);
 extern void font_set_name_and_index(FontType type, const char *name, int index);
+extern void font_set_encoding(CharacterEncoding encoding);
+extern void font_clear_cache(void);
 extern void font_set_antialias(bool enable);
 extern bool font_get_antialias(void);
 extern struct SDL_Surface *font_render_text(FontSpec spec, const char *str_utf8, SDL_Color color, bool antialias);

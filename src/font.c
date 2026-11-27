@@ -74,10 +74,16 @@ static Cache *glyph_cache;
 
 static struct {
 	bool antialiase_on;
+	CharacterEncoding encoding;
 	const char *name[FONTTYPEMAX];
 	int index[FONTTYPEMAX];
 	FT_Face face[FONTTYPEMAX];  // opened on first use, shared between all sizes
-} this;
+	bool face_is_fallback[FONTTYPEMAX];
+	FT_Face fallback_face[FONTTYPEMAX][2];  // [0] default/SJIS, [1] GBK/UTF8 (SC)
+	bool fallback_checked[FONTTYPEMAX][2];
+} this = {
+	.encoding = SHIFT_JIS,
+};
 
 #if defined(_WIN32) || defined(__ANDROID__)
 // Create a face from the whole content of `rw`. The memory holding the font
@@ -143,6 +149,133 @@ static FT_Face open_face(const char *name, int index) {
 	return face;
 }
 
+static bool is_sc_face_name(const char *family) {
+	if (!family)
+		return false;
+	return strstr(family, " SC") != NULL || strstr(family, "CN") != NULL;
+}
+
+static void select_sc_ttc_face(const char *path, FT_Face *face_io) {
+	FT_Face cur = *face_io;
+	if ((this.encoding != GBK && this.encoding != UTF8 && !chs_tbl_is_loaded()) || !cur || cur->num_faces <= 1)
+		return;
+	if (is_sc_face_name(cur->family_name) && strstr(cur->family_name, "Mono") != NULL)
+		return;
+
+	FT_Long num_faces = cur->num_faces;
+	FT_Face fallback_sc = NULL;
+	for (FT_Long i = 1; i < num_faces; i++) {
+		FT_Face cand = NULL;
+		if (FT_New_Face(ft_library, path, i, &cand) || !cand)
+			continue;
+		if (FT_Select_Charmap(cand, FT_ENCODING_UNICODE) == 0 && is_sc_face_name(cand->family_name)) {
+			if (strstr(cand->family_name, "Mono") != NULL) {
+				if (fallback_sc)
+					FT_Done_Face(fallback_sc);
+				FT_Done_Face(cur);
+				*face_io = cand;
+				return;
+			}
+			if (!fallback_sc) {
+				fallback_sc = cand;
+				continue;
+			}
+		}
+		FT_Done_Face(cand);
+	}
+	if (fallback_sc) {
+		FT_Done_Face(cur);
+		*face_io = fallback_sc;
+	}
+}
+
+static FT_Face get_fallback_face(FontType type) {
+	if (type >= FONTTYPEMAX)
+		return NULL;
+	int slot = (this.encoding == GBK || this.encoding == UTF8 || chs_tbl_is_loaded()) ? 1 : 0;
+	if (this.fallback_checked[type][slot])
+		return this.fallback_face[type][slot];
+	this.fallback_checked[type][slot] = true;
+
+	const char *env_fallback = getenv("XSYSTEM35_FONT_FALLBACK");
+	if (env_fallback && env_fallback[0]) {
+		FT_Face face = open_face(env_fallback, 0);
+		if (face) {
+			if (env_fallback[0] == '/')
+				select_sc_ttc_face(env_fallback, &face);
+			if (FT_Get_Char_Index(face, 0x8fd9) != 0) {
+				this.fallback_face[type][slot] = face;
+				return face;
+			}
+			FT_Done_Face(face);
+		}
+	}
+
+	static const char *const gothic_candidates[] = {
+#ifdef __ANDROID__
+		"/system/fonts/NotoSansCJK-Regular.ttc",
+		"/system/fonts/NotoSansSC-Regular.otf",
+		"/system/fonts/NotoSansSC-VF.ttf",
+		"/system/fonts/DroidSansFallback.ttf",
+		"fonts/HanaMinA.ttf",
+		"/system/fonts/NotoSerifCJK-Regular.ttc",
+#else
+		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/truetype/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
+		"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+#endif
+		"fonts/HanaMinA.ttf",
+		"fonts/mincho.ttf",
+		NULL
+	};
+	static const char *const mincho_candidates[] = {
+#ifdef __ANDROID__
+		"/system/fonts/NotoSerifCJK-Regular.ttc",
+		"fonts/HanaMinA.ttf",
+		"/system/fonts/NotoSansCJK-Regular.ttc",
+		"/system/fonts/NotoSansSC-Regular.otf",
+		"/system/fonts/NotoSansSC-VF.ttf",
+		"/system/fonts/DroidSansFallback.ttf",
+#else
+		"/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+		"/usr/share/fonts/noto-cjk/NotoSerifCJK-Regular.ttc",
+		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/truetype/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+#endif
+		"fonts/HanaMinA.ttf",
+		"fonts/MTLc3m.ttf",
+		NULL
+	};
+	const char *const *candidates = (type == FONT_MINCHO) ? mincho_candidates : gothic_candidates;
+	for (int i = 0; candidates[i]; i++) {
+		FT_Face face = open_face(candidates[i], 0);
+		if (!face)
+			continue;
+		if (candidates[i][0] == '/')
+			select_sc_ttc_face(candidates[i], &face);
+		// Verify the candidate actually contains Simplified Chinese glyphs (e.g. U+8FD9 "这").
+		if (FT_Get_Char_Index(face, 0x8fd9) != 0) {
+			this.fallback_face[type][slot] = face;
+			return face;
+		}
+		FT_Done_Face(face);
+	}
+	return NULL;
+}
+
+static bool set_face_size(FT_Face face, FontSpec spec, const char *label) {
+	// With a resolution of 0 (i.e. the default 72dpi), 1pt equals 1px.
+	if (FT_Set_Char_Size(face, 0, spec.size * 64, 0, 0) &&
+	    FT_Set_Pixel_Sizes(face, 0, spec.size)) {
+		WARNING("Cannot set the size of font %s to %d", label, spec.size);
+		return false;
+	}
+	return true;
+}
+
 // Since a face is shared between all sizes of a FontType, the size has to be
 // applied on every call.
 static bool font_select(FontSpec spec, Font *font) {
@@ -152,17 +285,34 @@ static bool font_select(FontSpec spec, Font *font) {
 	}
 	if (!this.face[spec.type]) {
 		this.face[spec.type] = open_face(this.name[spec.type], this.index[spec.type]);
-		if (!this.face[spec.type])
-			SYSERROR("Cannot open font %s", this.name[spec.type]);
+		this.face_is_fallback[spec.type] = false;
+		if (!this.face[spec.type]) {
+			const char *fallback_name = spec.type == FONT_MINCHO ? DEFAULT_MINCHO_TTF : DEFAULT_GOTHIC_TTF;
+			FT_Face fallback = get_fallback_face(spec.type);
+			if (!fallback)
+				fallback = open_face(fallback_name, 0);
+			if (fallback) {
+				WARNING("Cannot open font %s; using fallback font", this.name[spec.type]);
+				this.face[spec.type] = fallback;
+				this.face_is_fallback[spec.type] = true;
+			} else {
+				SYSERROR("Cannot open font %s", this.name[spec.type]);
+			}
+		}
 	}
 	FT_Face face = this.face[spec.type];
-
-	// With a resolution of 0 (i.e. the default 72dpi), 1pt equals 1px.
-	if (FT_Set_Char_Size(face, 0, spec.size * 64, 0, 0) &&
-	    FT_Set_Pixel_Sizes(face, 0, spec.size)) {
-		WARNING("Cannot set the size of font %s to %d", this.name[spec.type], spec.size);
-		return false;
+	// GBK always denotes Simplified Chinese, so replace an incomplete primary
+	// face with the SC fallback font. UTF-8 is encoding-only (used by Japanese,
+	// Latin, and Chinese games alike), so preserve the configured primary face
+	// here and fall back per-glyph in get_glyph().
+	if ((this.encoding == GBK || chs_tbl_is_loaded()) && FT_Get_Char_Index(face, 0x8fd9) == 0) {
+		FT_Face cjk = get_fallback_face(spec.type);
+		if (cjk)
+			face = cjk;
 	}
+
+	if (!set_face_size(face, spec, this.name[spec.type]))
+		return false;
 	font->face = face;
 	font->ascent = FT_CEIL(face->size->metrics.ascender);
 	font->height = font->ascent - FT_FLOOR(face->size->metrics.descender);
@@ -172,12 +322,27 @@ static bool font_select(FontSpec spec, Font *font) {
 // Distance from the top of the character cell to the baseline, the same value
 // GDI reports as TEXTMETRIC::tmAscent. The original engine positions text by
 // the cell top, so this determines where a glyph lands on the screen.
+//
+// The games were laid out for MS Gothic / MS Mincho / SimSun, whose cell is
+// the ideographic em box. CJK fonts such as Noto Sans/Serif CJK add line
+// spacing to usWinAscent (1.16em) and keep the em box in the typo metrics
+// (0.88em / -0.12em); use the em box for them, or text sits ~0.28em too low.
+// Latin fonts (e.g. DejaVu) keep usWinAscent, as GDI does.
+static bool has_cjk_em_box(const TT_OS2 *os2, int upem) {
+	enum { CJK_CODE_PAGES = 0x1f << 17 };  // JIS, GBK, Wansung, Big5, Johab
+	return os2->version >= 1 && (os2->ulCodePageRange1 & CJK_CODE_PAGES) &&
+		os2->sTypoLineGap == 0 && os2->sTypoAscender > 0 &&
+		os2->sTypoAscender < os2->usWinAscent &&
+		os2->sTypoAscender - os2->sTypoDescender == upem;
+}
+
 static int cell_ascent(const Font *font) {
 	TT_OS2 *os2 = FT_Get_Sfnt_Table(font->face, FT_SFNT_OS2);
 	if (!os2 || os2->version == 0xffff || !os2->usWinAscent)
 		return font->ascent;
 	int upem = font->face->units_per_EM;
-	return (os2->usWinAscent * font->face->size->metrics.y_ppem + upem / 2) / upem;
+	int ascent = has_cjk_em_box(os2, upem) ? os2->sTypoAscender : os2->usWinAscent;
+	return (ascent * font->face->size->metrics.y_ppem + upem / 2) / upem;
 }
 
 int font_cell_overhang(FontSpec spec) {
@@ -243,9 +408,18 @@ static const Glyph *get_glyph(FontSpec spec, FT_Face face, int code, bool antial
 	if (cached)
 		return cached;
 
-	if (!load_glyph(spec, face, code))
+	FT_Face render_face = face;
+	if (code > 0 && FT_Get_Char_Index(face, code) == 0) {
+		FT_Face alt = (face == this.face[spec.type])
+			? get_fallback_face(spec.type)
+			: this.face[spec.type];
+		if (alt && FT_Get_Char_Index(alt, code) != 0 && set_face_size(alt, spec, "fallback"))
+			render_face = alt;
+	}
+
+	if (!load_glyph(spec, render_face, code))
 		return NULL;
-	FT_GlyphSlot slot = face->glyph;
+	FT_GlyphSlot slot = render_face->glyph;
 	static Glyph temporary;
 	temporary.advance = slot->advance.x;
 	FT_Bitmap_Init(&temporary.bitmap);
@@ -401,6 +575,45 @@ void font_init(void) {
 	}
 }
 
+static void clear_primary_face(FontType type) {
+	FT_Face face = this.face[type];
+	if (face &&
+	    face != this.fallback_face[type][0] &&
+	    face != this.fallback_face[type][1]) {
+		FT_Done_Face(face);
+	}
+	this.face[type] = NULL;
+	this.face_is_fallback[type] = false;
+}
+
+#ifdef ALICEHUB_IOS
+void font_fini(void) {
+	cache_destroy(glyph_cache);
+	glyph_cache = NULL;
+	if (ft_library)
+		FT_Done_FreeType(ft_library);
+	ft_library = NULL;
+	memset(&this, 0, sizeof(this));
+	this.encoding = SHIFT_JIS;
+}
+#endif
+
+void font_set_encoding(CharacterEncoding encoding) {
+	if (this.encoding != encoding) {
+		this.encoding = encoding;
+		for (int i = 0; i < FONTTYPEMAX; i++) {
+			if (this.face_is_fallback[i])
+				clear_primary_face(i);
+		}
+		font_clear_cache();
+	}
+}
+
+void font_clear_cache(void) {
+	if (glyph_cache)
+		cache_clear(glyph_cache);
+}
+
 void font_set_name_and_index(FontType type, const char *name, int index) {
 	if (type >= FONTTYPEMAX) {
 		WARNING("Invalid font type %d", type);
@@ -410,6 +623,7 @@ void font_set_name_and_index(FontType type, const char *name, int index) {
 	cache_clear(glyph_cache);
 	this.name[type] = name;
 	this.index[type] = index;
+	clear_primary_face(type);
 }
 
 void font_set_antialias(bool enable) {

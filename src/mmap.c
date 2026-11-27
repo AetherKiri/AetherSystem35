@@ -181,7 +181,10 @@ mmap_t *map_file_readwrite(const char *path, size_t size) {
 }
 
 int unmap_file(mmap_t *m) {
+	if (!m)
+		return 0;
 #ifdef HAVE_MMAP
+	msync(m->addr, m->length, MS_ASYNC);
 	int rv = munmap(m->addr, m->length);
 	close(m->fd);
 	free(m);

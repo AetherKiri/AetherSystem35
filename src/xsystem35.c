@@ -22,10 +22,18 @@
 /* $Id: xsystem35.c,v 1.77 2003/11/16 15:29:52 chikama Exp $ */
 
 #include "config.h"
+#ifdef ALICEHUB_IOS
+#include "escalayer_modifier.h"
+#include "xsystem35_main.h"
+#include <setjmp.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <stdarg.h>
 #include <locale.h>
 #include <unistd.h>
@@ -67,10 +75,21 @@
 #include "volume.h"
 #include "msgskip.h"
 #include "texthook.h"
+#include "utfsjis.h"
+#ifdef XSYSTEM35_EMBEDDED
+#include "escalayer_modifier.h"
+#include "xsystem35_main.h"
+#endif
+#ifdef __SWITCH__
+#include "launcher.h"
+void freeGameResource(GameResource *gr);
+#endif
 
 static void xsystem35_exit_process(int code) {
 #ifdef XSYSTEM35_EMBEDDED
     xsystem35_host_exit(code);
+#elif defined(ALICEHUB_IOS)
+    sys_exit(code);
 #else
     exit(code);
 #endif
@@ -105,6 +124,29 @@ static bool fs_on;
 static bool host_audio_initialized, host_graphics_initialized;
 #endif
 
+#ifdef ALICEHUB_IOS
+static _Thread_local jmp_buf *exit_target;
+static int exit_code;
+static bool music_started;
+static bool graphics_started;
+
+void xsystem35_ios_exit(int code) {
+	if (exit_target) {
+		exit_code = code;
+		longjmp(*exit_target, 1);
+	}
+}
+
+void sl_fini(void);
+void ald_fini(void);
+void msgskip_fini(void);
+void font_fini(void);
+void cg_fini(void);
+void freeGameResource(GameResource *gr);
+void s39ain_fini(S39AIN *ain);
+void profile_fini(void);
+#endif
+
 static void sys35_usage(bool verbose) {
 	if (verbose) {
 		puts("System35 for X Window System [proj. Rainy Moon]");
@@ -115,6 +157,7 @@ static void sys35_usage(bool verbose) {
 	puts("OPTIONS");
 	puts(" -gamefile file          : set game resource file to 'file'");
 	puts(" -game game              : enable game-specific hacks");
+	puts(" -encoding enc           : set script text encoding ('sjis', 'gbk', or 'utf8')");
 	puts(" -savedir dir            : directory to save game state files");
 	puts(" -saveformat fmt         : save file format. 'xsystem35', 'system36' or 'system39' (default)");
 	puts(" -renderer name          : set rendering driver name to 'name'");
@@ -169,6 +212,9 @@ static void sys35_init() {
 	#ifdef XSYSTEM35_EMBEDDED
 	host_graphics_initialized = true;
 	#endif
+#ifdef ALICEHUB_IOS
+	graphics_started = true;
+#endif
 	ags_init(render_driver);
 
 	for (i = 0; i < FONTTYPEMAX; i++)
@@ -186,6 +232,7 @@ static void sys35_init() {
 }
 
 void sys35_remove(void) {
+	msgskip_syncFile();
 	dbg_quit();
 #ifdef XSYSTEM35_EMBEDDED
 	if (host_audio_initialized) mus_exit();
@@ -202,6 +249,22 @@ static void sys_reset(void) {
 	ags_reset();
 	mus_reset();
 	s39ain_reset(&nact->ain);
+}
+
+static bool parse_encoding_option(const char *mode, CharacterEncoding *out) {
+	if (!strcasecmp(mode, "sjis") || !strcasecmp(mode, "shift_jis") || !strcasecmp(mode, "shift-jis") || !strcasecmp(mode, "cp932")) {
+		*out = SHIFT_JIS;
+		return true;
+	}
+	if (!strcasecmp(mode, "gbk") || !strcasecmp(mode, "gb2312") || !strcasecmp(mode, "gb18030") || !strcasecmp(mode, "cp936")) {
+		*out = GBK;
+		return true;
+	}
+	if (!strcasecmp(mode, "utf8") || !strcasecmp(mode, "utf-8")) {
+		*out = UTF8;
+		return true;
+	}
+	return false;
 }
 
 static bool set_texthook_mode(const char *mode) {
@@ -315,6 +378,18 @@ static void sys35_ParseOption(int *argc, char **argv) {
 			if (argv[i + 1] != NULL) {
 				save_setFormat(argv[i + 1]);
 			}
+		} else if (0 == strcmp(argv[i], "-gamedir")) {
+			if (i + 1 < *argc)
+				i++;
+		} else if (0 == strcmp(argv[i], "-encoding")) {
+			if (i + 1 < *argc && argv[i + 1] != NULL) {
+				CharacterEncoding enc;
+				if (!parse_encoding_option(argv[++i], &enc)) {
+					fprintf(stderr, "xsystem35: Invalid encoding '%s'\n\n", argv[i]);
+					sys35_usage(false);
+				}
+				sys_setDefaultCharacterEncoding(enc, true);
+			}
 		}
 	}
 }
@@ -426,6 +501,12 @@ static void check_profile() {
 	if (param) {
 		load_censor_list(param);
 	}
+	param = get_profile("encoding");
+	if (param) {
+		CharacterEncoding enc;
+		if (parse_encoding_option(param, &enc))
+			sys_setDefaultCharacterEncoding(enc, true);
+	}
 }
 
 #if defined(HAVE_SIGACTION) && !defined(XSYSTEM35_EMBEDDED)
@@ -435,9 +516,12 @@ static void signal_handler(int sig_num) {
 }
 
 static void signal_handler_segv(int sig_num) {
-	fprintf(stderr, "PID(%d), sigsegv caught @ %03d, %05x\n", (int)getpid(), sl_getPage(), sl_getIndex());
+	char msg[128];
+	snprintf(msg, sizeof(msg), "Signal %d @ page %03d, 0x%05x", sig_num, sl_getPage(), sl_getIndex());
+	fprintf(stderr, "PID(%d), %s\n", (int)getpid(), msg);
+	sys_write_crash_log(msg);
 	sys35_remove();
-	xsystem35_exit_process(1);
+	_exit(1);
 }
 
 void sys_set_signalhandler(int SIG, void (*handler)(int)) {
@@ -463,6 +547,47 @@ static void init_signalhandler() {
 }
 #endif
 
+static bool is_uncensored_cg_ald_name(const char *name) {
+	if (!name || !name[0] || name[0] == '.')
+		return false;
+	size_t len = strlen(name);
+	if (len < 14 || strcasecmp(name + len - 4, ".ald") != 0)
+		return false;
+	static const char needle[] = "uncensored";
+	for (const char *p = name; *p; p++) {
+		size_t k = 0;
+		while (needle[k] && p[k] && tolower((unsigned char)p[k]) == needle[k])
+			k++;
+		if (needle[k] == '\0')
+			return true;
+	}
+	return false;
+}
+
+static void register_uncensored_cg_overlay(bool use_mmap) {
+	DIR *dir = opendir(".");
+	if (!dir)
+		return;
+	char *chosen = NULL;
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (!is_uncensored_cg_ald_name(ent->d_name))
+			continue;
+		if (!chosen ||
+		    !strcasecmp(ent->d_name, "AliceHubUncensoredCG.ald") ||
+		    (strcasecmp(chosen, "AliceHubUncensoredCG.ald") != 0 &&
+		     strcasecmp(ent->d_name, chosen) < 0)) {
+			free(chosen);
+			chosen = strdup(ent->d_name);
+		}
+	}
+	closedir(dir);
+	if (chosen) {
+		ald_init_overlay(DRIFILE_CG, chosen, use_mmap);
+		free(chosen);
+	}
+}
+
 static void registerGameFiles(void) {
 	if (nact->files.cnt[DRIFILE_SCO] == 0)
 		SYSERROR("No Scenario data available");
@@ -474,29 +599,98 @@ static void registerGameFiles(void) {
 		}
 		ald_init(type, nact->files.game_fname[type], nact->files.cnt[type], use_mmap);
 	}
+	register_uncensored_cg_overlay(true);
 	if (nact->files.save_path)
 		fc_init(nact->files.save_path);
 }
 
+#ifdef __SWITCH__
+static bool switch_open_game_resources(const char *save_dir)
+{
+	bool resource_ok = initGameResource(&nact->files, gameResourceFile, save_dir);
+	for (int type = 0; resource_ok && type < DRIFILETYPEMAX; type++)
+		resource_ok = dri_validate(nact->files.game_fname[type], nact->files.cnt[type],
+					   type == DRIFILE_SCO);
+	if (resource_ok)
+		return true;
+	alicehub_switch_set_launch_error("Cannot read game data; check the scenario ALDs and xsystem35.gr");
+	freeGameResource(&nact->files);
+	memset(&nact->files, 0, sizeof(nact->files));
+	return false;
+}
+#endif
+
 #ifdef XSYSTEM35_EMBEDDED
 int xsystem35_main(int argc, char **argv) {
+#elif defined(ALICEHUB_IOS)
+static int run_xsystem35(int argc, char **argv) {
+#elif defined(__SWITCH__)
+int alicehub_switch_engine_main(int argc, char **argv) {
 #else
 int main(int argc, char **argv) {
+#endif
+#if defined(__ANDROID__) && !defined(XSYSTEM35_EMBEDDED)
+	static bool sdl_main_entered = false;
+	if (sdl_main_entered) {
+		WARNING("Prevented duplicate SDL_main re-entry in :game process");
+		return 0;
+	}
+	sdl_main_entered = true;
 #endif
 #if defined(HAVE_SIGACTION) && !defined(XSYSTEM35_EMBEDDED)
 	sys_set_signalhandler(SIGINT, SIG_IGN);
 #endif
 	
-#if defined(__ANDROID__) && !defined(XSYSTEM35_EMBEDDED)
-	// Handle -gamedir option here so that .xsys35rc is loaded from that directory.
-	if (strcmp(argv[1], "-gamedir") == 0)
-		chdir(argv[2]);
+#ifndef XSYSTEM35_EMBEDDED
+	// Handle -gamedir option before loading .xsys35rc from that directory.
+	for (int i = 1; i + 1 < argc; i++) {
+		if (strcmp(argv[i], "-gamedir") == 0 && argv[i + 1] && argv[i + 1][0]) {
+			if (chdir(argv[i + 1]) != 0) {
+#ifdef __SWITCH__
+				alicehub_switch_set_launch_error("Cannot open the game folder");
+				return 1;
+#else
+				WARNING("Failed to chdir to -gamedir '%s'", argv[i + 1]);
+#endif
+			}
+			break;
+		}
+	}
+
+#endif
+#ifdef __SWITCH__
+	const char *switch_savedir = NULL;
+	for (int i = 1; i + 1 < argc; ++i) {
+		if (!strcmp(argv[i], "-savedir")) {
+			switch_savedir = argv[i + 1];
+			break;
+		}
+	}
+	if (!switch_open_game_resources(switch_savedir))
+		return 1;
 #endif
 	
+	// Load optional Longinus CHS.TBL character remap table before profile/options.
+	if (chs_tbl_load_from_dir(".")) {
+		sys_setDefaultCharacterEncoding(SHIFT_JIS, true);
+	}
+
+#ifdef ALICEHUB_IOS
+	const char *gothic = getenv("XSYSTEM35_FONT_GOTHIC");
+	const char *mincho = getenv("XSYSTEM35_FONT_MINCHO");
+	if (gothic && *gothic) fontname_tt[FONT_GOTHIC] = gothic;
+	if (mincho && *mincho) fontname_tt[FONT_MINCHO] = mincho;
+#endif
+#ifdef XSYSTEM35_EMBEDDED
+	if (!chs_tbl_is_loaded() && (xsystem35_host_fixed_encoding() || xsystem35_host_gbk()))
+		sys_setDefaultCharacterEncoding(xsystem35_host_gbk() ? GBK : SHIFT_JIS,
+		                                xsystem35_host_fixed_encoding());
+#endif
 	load_profile();
 	check_profile();
 	sys35_ParseOption(&argc, argv);
 	
+#ifndef __SWITCH__
 	if (!initGameResource(&nact->files, gameResourceFile, savedir)) {
 #ifdef _WIN32
 		sys_show_message_box(MESSAGEBOX_ERROR, "xsystem35", "Cannot find scenario file (*SA.ALD)");
@@ -505,6 +699,7 @@ int main(int argc, char **argv) {
 		sys35_usage(true);
 #endif
 	}
+#endif
 	registerGameFiles();
 	
 #if defined(HAVE_SIGACTION) && !defined(XSYSTEM35_EMBEDDED)
@@ -514,6 +709,9 @@ int main(int argc, char **argv) {
 	#ifdef XSYSTEM35_EMBEDDED
 	host_audio_initialized = true;
 	#endif
+#ifdef ALICEHUB_IOS
+	music_started = true;
+#endif
 	mus_init(audio_buffer_size);
 
 #ifdef HAVE_LIBINTL
@@ -553,12 +751,57 @@ int main(int argc, char **argv) {
 		sys_reset();
 	}
 
-#ifndef XSYSTEM35_EMBEDDED
+#if !defined(XSYSTEM35_EMBEDDED) && !defined(ALICEHUB_IOS)
 	sys35_remove();
 #endif
 	
 	return 0;
 }
+
+#ifdef ALICEHUB_IOS
+int xsystem35_main(int argc, char **argv) {
+	escalayer_modifier_reset(true);
+	jmp_buf target;
+	exit_target = &target;
+	if (setjmp(target) == 0)
+		exit_code = run_xsystem35(argc, argv);
+	exit_target = NULL;
+
+	msgskip_fini();
+	s39ain_fini(&nact->ain);
+	if (music_started) {
+		mus_exit();
+		music_started = false;
+	}
+	if (graphics_started) {
+		ags_remove();
+		font_fini();
+		cg_fini();
+		graphics_started = false;
+	} else {
+		SDL_Quit();
+	}
+	sl_fini();
+	v_set_names(0, NULL);
+	v_reset();
+	freeGameResource(&nact->files);
+	ald_fini();
+	memset(nact, 0, sizeof(*nact));
+	profile_fini();
+	gameResourceFile = "xsystem35.gr";
+	render_driver = NULL;
+	savedir = NULL;
+	font_noantialias = integer_scaling = fs_on = false;
+	audio_buffer_size = 0;
+	debugger_mode = DEBUGGER_DISABLED;
+	memset(fontface, 0, sizeof(fontface));
+	fontname_tt[FONT_GOTHIC] = DEFAULT_GOTHIC_TTF;
+	fontname_tt[FONT_MINCHO] = DEFAULT_MINCHO_TTF;
+	sys_resetCharacterEncoding();
+	escalayer_modifier_reset(false);
+	return exit_code;
+}
+#endif
 
 #ifdef __EMSCRIPTEN__
 
@@ -578,11 +821,14 @@ extern void sl_remove(void);
 extern void font_remove(void);
 extern void cg_remove(void);
 extern void s39ain_remove(S39AIN *ain);
-extern void msgskip_remove(void);
+extern void msgskip_fini(void);
 extern void gfx_draw_reset(void);
 extern void game_resource_remove(GameResource *gr);
 
 void xsystem35_session_reset(void) {
+    chs_tbl_reset();
+    sys_resetCharacterEncoding();
+    escalayer_modifier_reset(true);
     gameResourceFile = "xsystem35.gr";
     render_driver = NULL;
     savedir = NULL;
@@ -607,7 +853,7 @@ void xsystem35_session_cleanup(void) {
     s39ain_reset(&nact->ain);
     va_reset();
     sys35_remove();
-    msgskip_remove();
+    msgskip_fini();
     sl_remove();
     cg_remove();
     font_remove();
@@ -616,6 +862,9 @@ void xsystem35_session_cleanup(void) {
     game_resource_remove(&nact->files);
     memset(&nact->ags, 0, sizeof(nact->ags));
     profile_clear();
+    chs_tbl_reset();
+    xsystem35_clear_virtual_inputs();
+    escalayer_modifier_reset(false);
     gfx_draw_reset();
 }
 #endif

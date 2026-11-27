@@ -26,6 +26,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <dirent.h>
+#include <limits.h>
+#include <strings.h>
+#endif
 #include "sdl_compat.h"
 
 #include "portab.h"
@@ -43,10 +48,15 @@ static char         *playlist[PLAYLIST_MAX];
 static mixer_music  *music;
 static int          trackno; // 現在演奏中のトラック
 static int          start_time;
+static int          fade_volume = 100;
 
 static void apply_volume(void) {
-	mixer_music_set_gain(music, prv.volval[BGM_VOLVAL_CH] / 100.0f);
+	mixer_music_set_gain(music, (fade_volume * prv.volval[BGM_VOLVAL_CH]) / 10000.0f);
 }
+
+#ifdef __ANDROID__
+static bool resolve_case_insensitive_path(const char *src, char *out, size_t out_cap);
+#endif
 
 static bool cdrom_init(char *playlist_path) {
 	char buf[256];
@@ -55,6 +65,13 @@ static bool cdrom_init(char *playlist_path) {
 		return false;
 
 	FILE *fp = fopen(playlist_path, "r");
+#ifdef __ANDROID__
+	if (!fp) {
+		char pl_resolved[PATH_MAX];
+		if (resolve_case_insensitive_path(playlist_path, pl_resolved, sizeof(pl_resolved)))
+			fp = fopen(pl_resolved, "r");
+	}
+#endif
 	if (fp) {
 		// Skip the first line
 		if (!fgets(buf, sizeof(buf), fp)) {
@@ -63,6 +80,13 @@ static bool cdrom_init(char *playlist_path) {
 		}
 	} else {
 		fp = fopen("_inmm.ini", "r");
+#ifdef __ANDROID__
+		if (!fp) {
+			char inmm_resolved[PATH_MAX];
+			if (resolve_case_insensitive_path("_inmm.ini", inmm_resolved, sizeof(inmm_resolved)))
+				fp = fopen(inmm_resolved, "r");
+		}
+#endif
 	}
 	if (!fp) {
 		// If the game has MIDI music, lack of the playlist is not a problem.
@@ -109,6 +133,64 @@ static void cdrom_reset(void) {
 	}
 }
 
+#ifdef __ANDROID__
+static bool resolve_case_insensitive_path(const char *src, char *out, size_t out_cap) {
+	if (!src || !src[0] || out_cap < 4)
+		return false;
+	char copy[PATH_MAX];
+	if (strlen(src) >= sizeof(copy))
+		return false;
+	strcpy(copy, src);
+
+	size_t len = 0;
+	if (copy[0] == '/') {
+		out[0] = '/';
+		out[1] = '\0';
+		len = 1;
+	} else {
+		out[0] = '.';
+		out[1] = '\0';
+		len = 1;
+	}
+
+	char *saveptr = NULL;
+	for (char *tok = strtok_r(copy, "/", &saveptr); tok; tok = strtok_r(NULL, "/", &saveptr)) {
+		if (!tok[0] || strcmp(tok, ".") == 0)
+			continue;
+		const char *match = tok;
+		char matched_name[NAME_MAX + 1];
+		if (strcmp(tok, "..") != 0) {
+			DIR *d = opendir(out);
+			if (d) {
+				struct dirent *de;
+				while ((de = readdir(d)) != NULL) {
+					if (strcasecmp(de->d_name, tok) == 0) {
+						snprintf(matched_name, sizeof(matched_name), "%s", de->d_name);
+						match = matched_name;
+						break;
+					}
+				}
+				closedir(d);
+			}
+		}
+		if (len > 1 && out[len - 1] != '/') {
+			if (len + 1 >= out_cap)
+				return false;
+			out[len++] = '/';
+			out[len] = '\0';
+		} else if (len == 1 && out[0] == '.') {
+			len = 0;
+		}
+		size_t mlen = strlen(match);
+		if (len + mlen >= out_cap)
+			return false;
+		memcpy(out + len, match, mlen + 1);
+		len += mlen;
+	}
+	return len > 0;
+}
+#endif
+
 /* トラック番号 trk の演奏 trk = 1~ */
 static bool cdrom_start(int trk, int loop) {
 	if (!enabled) return 0;
@@ -125,8 +207,13 @@ static bool cdrom_start(int trk, int loop) {
 	// mixer_music_load_file() opens the file with SDL_IOFromFile(), which
 	// requires an absolute path on Android.
 	char path[PATH_MAX];
-	if (!realpath(playlist[trk], path))
-		return false;
+	char resolved[PATH_MAX];
+	const char *cand = playlist[trk];
+	if (!realpath(cand, path)) {
+		if (!resolve_case_insensitive_path(cand, resolved, sizeof(resolved)) ||
+		    !realpath(resolved, path))
+			return false;
+	}
 	music = mixer_music_load_file(path);
 #else
 	music = mixer_music_load_file(playlist[trk]);
@@ -186,6 +273,12 @@ static void cdrom_reapply_volume(void) {
 		apply_volume();
 }
 
+static void cdrom_set_volume(int level) {
+	fade_volume = level < 0 ? 0 : (level > 100 ? 100 : level);
+	if (music)
+		apply_volume();
+}
+
 cdromdevice_t cdrom_mp3 = {
 	.init = cdrom_init,
 	.exit = cdrom_exit,
@@ -195,4 +288,5 @@ cdromdevice_t cdrom_mp3 = {
 	.getpos = cdrom_getPlayingInfo,
 	.is_available = cdrom_is_available,
 	.reapply_volume = cdrom_reapply_volume,
+	.set_volume = cdrom_set_volume,
 };

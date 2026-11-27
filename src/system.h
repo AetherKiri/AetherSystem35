@@ -41,6 +41,7 @@ enum messagebox_type {
 	MESSAGEBOX_INFO,
 };
 void sys_show_message_box(enum messagebox_type type, const char* title_utf8, const char* message_utf8);
+void sys_write_crash_log(const char *reason);
 
 void sys35_remove(void);
 

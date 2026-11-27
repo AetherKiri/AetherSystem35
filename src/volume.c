@@ -96,7 +96,16 @@ void volume_init(void) {
 			if (s1[0] == '\0') continue;
 			if (i >= MAXVOLCH || i < 0) continue;
 			s1[strlen(s1)-1] = '\0'; // remove last '"'
-			vval[i].label = sjis2utf(s1);
+			if (!sys_isCharacterEncodingLocked() && nact->encoding == SHIFT_JIS && cjk_looks_like_gbk((const uint8_t *)s1)) {
+				sys_setDefaultCharacterEncoding(GBK, false);
+			}
+			// Decode mixed System39.ini labels accurately even if game text and INI encodings differ.
+			int sjis_err = 0, gbk_err = 0, gbk_valid = 0;
+			cjk_score_sample((const uint8_t *)s1, &sjis_err, &gbk_err, &gbk_valid);
+			CharacterEncoding label_enc = (gbk_valid > 0 && sjis_err > gbk_err) ? GBK
+				: (nact->encoding == GBK && gbk_err > sjis_err) ? SHIFT_JIS
+				: nact->encoding;
+			vval[i].label = codeconv(UTF8, label_enc, s1);
 			vval_max = max(vval_max, i);
 			nvalancer++;
 		}

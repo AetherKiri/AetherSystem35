@@ -12,6 +12,7 @@ extern "C" {
 struct xsystem35_host {
     void *user;
     int gbk_text;
+    int fixed_encoding;
     void (*present)(void *user, const SDL_Surface *surface);
     int (*poll_event)(void *user, SDL_Event *event);
     int (*checkpoint)(void *user);
@@ -23,6 +24,7 @@ int xsystem35_host_run(const struct xsystem35_host *host, const char *root,
                        const char *saves, const char *font);
 void xsystem35_host_exit(int code);
 int xsystem35_host_gbk(void);
+int xsystem35_host_fixed_encoding(void);
 void xsystem35_host_checkpoint(void);
 int xsystem35_host_poll_event(SDL_Event *event);
 void xsystem35_host_present(void);

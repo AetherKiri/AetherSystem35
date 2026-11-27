@@ -28,6 +28,8 @@
 #include "scenario.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#endif
+#if defined(HAVE_MMAP) || defined(__EMSCRIPTEN__) || defined(__ANDROID__)
 #include <sys/mman.h>
 #endif
 
@@ -110,6 +112,17 @@ bool msgskip_isSkipping(void) {
 	return msgskip.enabled & msgskip.activated;
 }
 
+#if defined(ALICEHUB_IOS) || defined(XSYSTEM35_EMBEDDED)
+void msgskip_fini(void) {
+	msgskip_syncFile();
+	if (msgskip.map)
+		unmap_file(msgskip.map);
+	memset(&msgskip, 0, sizeof(msgskip));
+	msgskip.flags = MSGSKIP_STOP_ON_UNSEEN | MSGSKIP_STOP_ON_MENU | MSGSKIP_STOP_ON_CLICK;
+	msgskip.enabled = true;
+}
+#endif
+
 bool msgskip_isActivated(void) {
 	return msgskip.activated;
 }
@@ -172,25 +185,15 @@ void msgskip_setFlags(unsigned flags, unsigned mask) {
 	msgskip.flags |= (flags & mask);
 }
 
-#ifdef __EMSCRIPTEN__
-
 EMSCRIPTEN_KEEPALIVE
-void msgskip_syncFile() {
-	if (!msgskip.dirty)
+void msgskip_syncFile(void) {
+	if (!msgskip.dirty || !msgskip.map)
 		return;
+#if defined(HAVE_MMAP) || defined(__EMSCRIPTEN__) || defined(__ANDROID__)
 	msync(msgskip.map->addr, msgskip.map->length, MS_ASYNC);
+#endif
+#ifdef __EMSCRIPTEN__
 	EM_ASM( xsystem35.shell.syncfs(); );
+#endif
 	msgskip.dirty = false;
 }
-
-#endif // __EMSCRIPTEN__
-
-#ifdef XSYSTEM35_EMBEDDED
-
-void msgskip_remove(void) {
- if(msgskip.map) unmap_file(msgskip.map);
- memset(&msgskip, 0, sizeof(msgskip));
- msgskip.flags=MSGSKIP_STOP_ON_UNSEEN | MSGSKIP_STOP_ON_MENU | MSGSKIP_STOP_ON_CLICK;
- msgskip.enabled=true;
-}
-#endif
