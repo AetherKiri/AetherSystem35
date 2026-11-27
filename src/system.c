@@ -168,6 +168,10 @@ void sys_sleep(int msec) {
 #ifdef XSYSTEM35_EMBEDDED
 	xsystem35_host_checkpoint();
 #endif
+	if (sys_is_quit_requested()) {
+		nact_quit(false);
+		return;
+	}
 	gfx_updateScreen();
 	dbg_onsleep();
 #ifdef __EMSCRIPTEN__
@@ -175,7 +179,13 @@ void sys_sleep(int msec) {
 #elif defined(__ANDROID__)
 	gfx_android_delay(msec);
 #else
-	SDL_Delay(msec);
+	while (msec > 0 && !sys_is_quit_requested()) {
+		int chunk = msec > 50 ? 50 : msec;
+		SDL_Delay(chunk);
+		msec -= chunk;
+	}
+	if (sys_is_quit_requested())
+		nact_quit(false);
 #endif
 	scheduler_on_event(SCHEDULER_EVENT_SLEEP);
 }
@@ -195,6 +205,10 @@ void sys_wait_vsync(void) {
 #ifdef XSYSTEM35_EMBEDDED
 	xsystem35_host_checkpoint();
 #endif
+	if (sys_is_quit_requested()) {
+		nact_quit(false);
+		return;
+	}
 #if defined(__ANDROID__) && !defined(XSYSTEM35_EMBEDDED)
 	gfx_android_pre_present();
 	gfx_updateScreen();

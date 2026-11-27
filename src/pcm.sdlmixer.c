@@ -163,6 +163,7 @@ bool muspcm_init(int audio_buffer_size) {
 
 void muspcm_exit(void) {
 	muspcm_reset();
+	wai_unload();
 	mixer_quit();
 }
 
